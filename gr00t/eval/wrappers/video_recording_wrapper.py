@@ -200,6 +200,15 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.step_count = 0
 
         self.is_success = False
+        # Number of render-cadence frames to keep recording after the task is
+        # solved before finalizing the video (a short tail past the success
+        # moment instead of cutting exactly on it).
+        self.post_success_render_steps = 10
+        # Counts down those tail frames once success is seen; None until then.
+        self.post_success_renders_left = None
+        # Latches once the tail is done so we skip recording the remaining steps
+        # up to the horizon.
+        self.recording_stopped = False
 
     def reset(self, **kwargs):
         result = super().reset(**kwargs)
@@ -207,29 +216,52 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.step_count = 1
         self.video_recorder.stop()
 
-        # if self.video_dir is not None and self.file_path is not None:
-        #     # rename the file to indicate success or failure
-        #     original_filestem = self.file_path.stem
-        #     new_filestem = f"{original_filestem}_success{int(self.is_success)}"
-        #     new_file_path = self.video_dir / f"{new_filestem}.mp4"
-        #     os.rename(self.file_path, new_file_path)
-
         self.is_success = False
-        if self.video_dir is not None:
-            self.file_path = self.video_dir / f"{uuid.uuid4()}.mp4"
+        self.post_success_renders_left = None
+        self.recording_stopped = False
+        # Name the video by the (deterministic) reset seed so each rollout's
+        # video maps back to its env seed by filename (media/seed{seed}.mp4),
+        # matching the per-seed eval_log entries. Unseeded resets -- e.g. the
+        # vector env's auto-reset into a throwaway episode -- get no video, so
+        # the seed-named file is never overwritten.
+        seed = kwargs.get("seed", None)
+        if self.video_dir is not None and seed is not None:
+            media_dir = self.video_dir / "media"
+            media_dir.mkdir(parents=True, exist_ok=True)
+            self.file_path = media_dir / f"seed{seed}.mp4"
+        else:
+            self.file_path = None
         return result
 
     def step(self, action):
         result = super().step(action)
         self.step_count += 1
-        if self.file_path is not None and ((self.step_count % self.steps_per_render) == 0):
-            if not self.video_recorder.is_ready():
-                self.video_recorder.start(self.file_path)
+        success = bool(result[-1]["success"])
+        if self.file_path is not None and not self.recording_stopped:
+            is_render_step = (self.step_count % self.steps_per_render) == 0
+            # Render on the usual cadence, but also force a frame on the success
+            # step so the moment the task is solved is always captured.
+            if is_render_step or success:
+                if not self.video_recorder.is_ready():
+                    self.video_recorder.start(self.file_path)
 
-            frame = self.env.render()
-            assert frame.dtype == np.uint8
-            self.video_recorder.write_frame(frame)
-            self.is_success = result[-1]["success"]
+                frame = self.env.render()
+                assert frame.dtype == np.uint8
+                self.video_recorder.write_frame(frame)
+                self.is_success = self.is_success or success
+            # Keep recording for a short tail of render frames after success,
+            # then finalize so the video ends shortly past the success moment
+            # instead of running on to the full horizon (matching the
+            # diffusion-policy eval videos). The episode keeps stepping; only
+            # the recording stops.
+            if success and self.post_success_renders_left is None:
+                # Start the tail; count render frames from the NEXT render step.
+                self.post_success_renders_left = self.post_success_render_steps
+            elif self.post_success_renders_left is not None and is_render_step:
+                self.post_success_renders_left -= 1
+                if self.post_success_renders_left <= 0:
+                    self.video_recorder.stop()
+                    self.recording_stopped = True
         return result
 
     def render(self, mode="rgb_array", **kwargs):

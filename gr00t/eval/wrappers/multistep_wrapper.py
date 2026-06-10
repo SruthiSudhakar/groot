@@ -193,6 +193,11 @@ class MultiStepWrapper(gym.Wrapper):
         self.done = list()
         self.info = defaultdict(lambda: deque(maxlen=self.max_steps_needed + 1))
 
+        # Per-episode trackers (in *base* env steps) used to report the step at
+        # which the task was first solved (None until/unless it succeeds).
+        self.episode_base_step = 0
+        self.success_step = None
+
         obs = self._get_obs(self.video_delta_indices, self.state_delta_indices)
         info = {k: [v] for k, v in info.items()}
         return obs, info
@@ -212,6 +217,10 @@ class MultiStepWrapper(gym.Wrapper):
                 # termination
                 break
             observation, reward, done, truncated, info = super().step(act)
+            # Track, in base env steps, when the task is first solved.
+            self.episode_base_step += 1
+            if self.success_step is None and bool(info.get("success", False)):
+                self.success_step = self.episode_base_step
             env_state = {"states": [], "model": []}
             states.append(env_state["states"])
             rewards.append(reward)
@@ -238,6 +247,11 @@ class MultiStepWrapper(gym.Wrapper):
         info["model"] = env_state["model"]
         info["actions"] = action
         info["dones"] = dones
+        # Per-episode summary fields (surfaced via the vector env's `final_info`
+        # so the caller can map each rollout's outcome back to its seed).
+        info["success_step"] = self.success_step
+        info["episode_base_step"] = self.episode_base_step
+        info["episode_success"] = self.success_step is not None
         return observation, reward, done, truncated, info
 
     def _get_obs(self, video_delta_indices, state_delta_indices):

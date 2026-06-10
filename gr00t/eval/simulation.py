@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
+import os
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -53,6 +55,12 @@ class VideoConfig:
     crf: int = 22
     thread_type: str = "FRAME"
     thread_count: int = 1
+    # Saved-video camera. When render_camera and/or render_width/render_height are set,
+    # the env renders a fresh frame from the sim (any scene camera, arbitrary res)
+    # instead of the cached 256x256 policy observation image. Policy obs is unchanged.
+    render_camera: Optional[str] = None
+    render_width: Optional[int] = None
+    render_height: Optional[int] = None
 
 
 @dataclass
@@ -113,57 +121,116 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
                 context="spawn",
             )
 
-    def run_simulation(self, config: SimulationConfig) -> Tuple[str, List[bool]]:
-        """Run the simulation for the specified number of episodes."""
+    def run_simulation(
+        self, config: SimulationConfig, test_start_seed: int = 100000
+    ) -> Tuple[str, List[bool], List[Dict[str, Any]]]:
+        """Run the simulation for the specified number of episodes.
+
+        Episodes are pinned to deterministic env seeds ``test_start_seed + i``
+        (so initial conditions are identical across runs) and executed in
+        chunks of ``n_envs``. Each episode's video is named ``media/seed{seed}.mp4``.
+
+        Returns the env name, the per-episode success flags (ordered by seed),
+        and a list of per-episode record dicts (seed / success / reward /
+        success_step / success_time_sec / video_path), suitable for writing a
+        per-episode eval summary.
+        """
         start_time = time.time()
+        n_episodes = config.n_episodes
+        n_envs = config.n_envs
         print(
-            f"Running {config.n_episodes} episodes for {config.env_name} with {config.n_envs} environments"
+            f"Running {n_episodes} episodes for {config.env_name} with {n_envs} environments"
         )
         # Set up the environment
         self.env = self.setup_environment(config)
-        # Initialize tracking variables
-        episode_lengths = []
-        current_rewards = [0] * config.n_envs
-        current_lengths = [0] * config.n_envs
-        completed_episodes = 0
-        current_successes = [False] * config.n_envs
-        episode_successes = []
-        # Initial environment reset
-        obs, _ = self.env.reset()
-        # Main simulation loop
-        while completed_episodes < config.n_episodes:
-            # Process observations and get actions from the server
-            actions = self._get_actions_from_server(obs)
-            # Step the environment
-            next_obs, rewards, terminations, truncations, env_infos = self.env.step(actions)
-            # Update episode tracking
-            for env_idx in range(config.n_envs):
-                current_successes[env_idx] |= bool(env_infos["success"][env_idx][0])
-                current_rewards[env_idx] += rewards[env_idx]
-                current_lengths[env_idx] += 1
-                # If episode ended, store results
-                if terminations[env_idx] or truncations[env_idx]:
-                    episode_lengths.append(current_lengths[env_idx])
-                    episode_successes.append(current_successes[env_idx])
-                    cumulative_sr = float(np.mean(episode_successes))
-                    print(f"EP {len(episode_successes)} success: {current_successes[env_idx]}; Cumulative success rate: {cumulative_sr}")
-                    current_successes[env_idx] = False
-                    completed_episodes += 1
-                    # Reset trackers for this environment
-                    current_rewards[env_idx] = 0
-                    current_lengths[env_idx] = 0
-            obs = next_obs
+
+        # Control frequency (Hz) -> convert the first-success base step into
+        # wall-clock seconds. Robocasa defaults to 20 Hz; fall back if unreadable.
+        try:
+            control_freq = float(self.env.get_attr("control_freq")[0])
+        except Exception:
+            control_freq = 20.0
+
+        # Deterministic per-episode env seeds and the dir videos land in.
+        seeds = [test_start_seed + i for i in range(n_episodes)]
+        media_dir = (
+            os.path.join(config.video.video_dir, "media")
+            if config.video.video_dir is not None
+            else None
+        )
+
+        episode_records: List[Dict[str, Any]] = []
+        n_chunks = math.ceil(n_episodes / n_envs)
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * n_envs
+            end = min(n_episodes, start + n_envs)
+            k = end - start  # number of *active* (non-padding) envs this chunk
+            chunk_seeds = seeds[start:end]
+            # AsyncVectorEnv needs exactly n_envs seeds; pad with None (unseeded,
+            # no video) for a short final chunk.
+            reset_seeds = list(chunk_seeds) + [None] * (n_envs - k)
+
+            # Seeded reset: pins each env's scene and names its video by seed.
+            obs, _ = self.env.reset(seed=reset_seeds)
+
+            active_done = [False] * n_envs
+            max_reward = [0.0] * n_envs
+            succ_step: List[Optional[int]] = [None] * n_envs
+
+            # Step until every active env has finished its (seeded) episode. Envs
+            # that finish early auto-reset into an unseeded throwaway episode that
+            # we simply ignore.
+            while not all(active_done[:k]):
+                actions = self._get_actions_from_server(obs)
+                obs, rewards, terminations, truncations, env_infos = self.env.step(actions)
+                final_info = env_infos.get("final_info") if isinstance(env_infos, dict) else None
+                for env_idx in range(k):
+                    if active_done[env_idx]:
+                        continue
+                    max_reward[env_idx] = max(max_reward[env_idx], float(rewards[env_idx]))
+                    if terminations[env_idx] or truncations[env_idx]:
+                        active_done[env_idx] = True
+                        # Pull the terminal episode's success step out of final_info.
+                        fi = final_info[env_idx] if final_info is not None else None
+                        if isinstance(fi, dict):
+                            succ_step[env_idx] = fi.get("success_step")
+
+            for env_idx in range(k):
+                seed = chunk_seeds[env_idx]
+                step = succ_step[env_idx]
+                success = bool(max_reward[env_idx] > 0)
+                episode_records.append(
+                    {
+                        "episode": start + env_idx,
+                        "seed": int(seed),
+                        "success": success,
+                        "reward": float(max_reward[env_idx]),
+                        "success_step": (int(step) if step is not None else None),
+                        "success_time_sec": (
+                            round(step / control_freq, 2) if step is not None else None
+                        ),
+                        "video_path": (
+                            os.path.join(media_dir, f"seed{seed}.mp4")
+                            if media_dir is not None
+                            else None
+                        ),
+                    }
+                )
+            cumulative_sr = float(np.mean([r["success"] for r in episode_records]))
+            print(
+                f"Chunk {chunk_idx + 1}/{n_chunks} done "
+                f"({len(episode_records)}/{n_episodes} episodes); "
+                f"cumulative success rate: {cumulative_sr:.3f}"
+            )
+
         # Clean up
-        self.env.reset()
         self.env.close()
         self.env = None
+        episode_successes = [r["success"] for r in episode_records]
         print(
-            f"Collecting {config.n_episodes} episodes took {time.time() - start_time:.2f} seconds"
+            f"Collecting {n_episodes} episodes took {time.time() - start_time:.2f} seconds"
         )
-        assert (
-            len(episode_successes) >= config.n_episodes
-        ), f"Expected at least {config.n_episodes} episodes, got {len(episode_successes)}"
-        return config.env_name, episode_successes
+        return config.env_name, episode_successes, episode_records
 
     def _get_actions_from_server(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """Process observations and get actions from the inference server."""
@@ -181,7 +248,14 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
 def _create_single_env(config: SimulationConfig, idx: int) -> gym.Env:
     """Create a single environment with appropriate wrappers."""
     # Create base environment
-    env = gym.make(config.env_name, split=config.split, enable_render=True)
+    env = gym.make(
+        config.env_name,
+        split=config.split,
+        enable_render=True,
+        render_camera=config.video.render_camera,
+        render_width=config.video.render_width,
+        render_height=config.video.render_height,
+    )
     # Add video recording wrapper if needed (only for the first environment)
     if config.video.video_dir is not None:
         video_recorder = VideoRecorder.create_h264(
