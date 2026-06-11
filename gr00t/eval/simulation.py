@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import multiprocessing
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -22,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
+from tqdm import tqdm
 
 # Required for robocasa environments
 import robocasa  # noqa: F401
@@ -119,6 +122,9 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
                 env_fns,
                 shared_memory=False,
                 context="spawn",
+                # Don't auto-reset finished envs (no throwaway RoboCasa scene
+                # rebuilds while a chunk drains). See _no_autoreset_worker.
+                worker=_no_autoreset_worker,
             )
 
     def run_simulation(
@@ -143,6 +149,10 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
         )
         # Set up the environment
         self.env = self.setup_environment(config)
+
+        # Per-vector-step wall-clock timeout (seconds). A normal step takes a few
+        # seconds; only a wedged worker exceeds this. Override via env var.
+        self.step_timeout_sec = float(os.environ.get("EVAL_STEP_TIMEOUT_SEC", "180"))
 
         # Control frequency (Hz) -> convert the first-success base step into
         # wall-clock seconds. Robocasa defaults to 20 Hz; fall back if unreadable.
@@ -177,12 +187,40 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
             max_reward = [0.0] * n_envs
             succ_step: List[Optional[int]] = [None] * n_envs
 
-            # Step until every active env has finished its (seeded) episode. Envs
-            # that finish early auto-reset into an unseeded throwaway episode that
-            # we simply ignore.
+            # Step until every active env has finished its (seeded) episode.
+            # Finished envs are NOT auto-reset (see _no_autoreset_worker); they
+            # just hold their terminal state while the rest of the chunk drains.
+            # The bar tracks base env steps for the episode (each vector step
+            # advances n_action_steps), so 0 -> max_episode_steps.
+            n_action_steps = config.multistep.n_action_steps
+            max_steps = config.multistep.max_episode_steps
+            pbar = tqdm(
+                total=max_steps,
+                desc=f"{config.env_name} chunk {chunk_idx + 1}/{n_chunks}",
+                unit=" step",
+                leave=False,  # bar disappears after the chunk, keeping logs clean
+                mininterval=5.0,  # throttle refreshes for non-tty run.sh logs
+            )
+            timed_out = False
             while not all(active_done[:k]):
                 actions = self._get_actions_from_server(obs)
-                obs, rewards, terminations, truncations, env_infos = self.env.step(actions)
+                try:
+                    obs, rewards, terminations, truncations, env_infos = self._step(actions)
+                except multiprocessing.TimeoutError:
+                    # A worker wedged. Don't hang the whole eval: leave the
+                    # unfinished envs as not-done (they get recorded as 0 reward /
+                    # no success below, i.e. failures) and rebuild the env so the
+                    # episode count per task stays fixed at n_episodes.
+                    n_unfinished = sum(1 for d in active_done[:k] if not d)
+                    print(
+                        f"  Step exceeded {self.step_timeout_sec}s on chunk "
+                        f"{chunk_idx + 1}; marking {n_unfinished} unfinished "
+                        f"episode(s) as failures and rebuilding the env."
+                    )
+                    timed_out = True
+                    break
+                pbar.update(n_action_steps)
+                pbar.set_postfix_str(f"{max(max_steps - pbar.n, 0)} steps left")
                 final_info = env_infos.get("final_info") if isinstance(env_infos, dict) else None
                 for env_idx in range(k):
                     if active_done[env_idx]:
@@ -191,9 +229,19 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
                     if terminations[env_idx] or truncations[env_idx]:
                         active_done[env_idx] = True
                         # Pull the terminal episode's success step out of final_info.
+                        # The wrapper emits -1 (sentinel) when the episode never
+                        # succeeded; map that back to None here.
                         fi = final_info[env_idx] if final_info is not None else None
                         if isinstance(fi, dict):
-                            succ_step[env_idx] = fi.get("success_step")
+                            s = fi.get("success_step")
+                            succ_step[env_idx] = int(s) if (s is not None and s >= 0) else None
+            pbar.close()
+
+            if timed_out:
+                # Force-kill the wedged workers and start a fresh vector env for
+                # the remaining chunks.
+                self.env.close(terminate=True)
+                self.env = self.setup_environment(config)
 
             for env_idx in range(k):
                 seed = chunk_seeds[env_idx]
@@ -232,6 +280,18 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
         )
         return config.env_name, episode_successes, episode_records
 
+    def _step(self, actions):
+        """Step the vector env, applying a wall-clock timeout for async envs.
+
+        Stock ``env.step()`` blocks forever if a worker wedges; ``step_wait``
+        with a timeout raises ``multiprocessing.TimeoutError`` instead, so the
+        caller can recover rather than hang.
+        """
+        if isinstance(self.env, gym.vector.AsyncVectorEnv):
+            self.env.step_async(actions)
+            return self.env.step_wait(timeout=self.step_timeout_sec)
+        return self.env.step(actions)
+
     def _get_actions_from_server(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """Process observations and get actions from the inference server."""
         # Get actions from the server
@@ -243,6 +303,90 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
             actions = action_dict
         # Add batch dimension to actions
         return actions
+
+
+def _no_autoreset_worker(index, env_fn, pipe, parent_pipe, shared_memory, error_queue):
+    """AsyncVectorEnv worker that does NOT auto-reset an env when it finishes.
+
+    This is a copy of gymnasium 0.29's default ``_worker`` with one change: a
+    terminated/truncated env is left in its terminal state instead of being
+    reset. RoboCasa's ``reset()`` rebuilds the entire kitchen scene, so the
+    default behaviour makes every early-finishing env regenerate a random
+    throwaway scene (and occasionally wedge a worker) while it waits for the
+    slowest env in the chunk. We still surface the terminal episode's info as
+    ``final_info``/``final_observation``, exactly like the default worker, so the
+    run loop is unchanged. Re-stepping a finished env is a no-op because
+    MultiStepWrapper short-circuits once it is done.
+    """
+    assert shared_memory is None
+    env = env_fn()
+    parent_pipe.close()
+    try:
+        while True:
+            command, data = pipe.recv()
+            if command == "reset":
+                observation, info = env.reset(**data)
+                pipe.send(((observation, info), True))
+            elif command == "step":
+                observation, reward, terminated, truncated, info = env.step(data)
+                if terminated or truncated:
+                    # Surface the terminal info the same way gymnasium does on
+                    # autoreset, but WITHOUT calling env.reset().
+                    final_info = dict(info)
+                    # The per-episode summary fields are terminal-only and live
+                    # in final_info. Pop them off the top-level info so they are
+                    # not batched by the vector env's _add_info across envs.
+                    # (With gymnasium's default autoreset these never reached
+                    # top-level info.) NOTE: this only fires on terminal steps;
+                    # the crash-prevention for mid-episode steps comes from the
+                    # MultiStepWrapper emitting an int sentinel (-1) for an
+                    # unsolved success_step rather than None, keeping the
+                    # _add_info array dtype consistent across envs.
+                    for key in ("success_step", "episode_base_step", "episode_success"):
+                        info.pop(key, None)
+                    info["final_observation"] = observation
+                    info["final_info"] = final_info
+                pipe.send(((observation, reward, terminated, truncated, info), True))
+            elif command == "seed":
+                env.seed(data)
+                pipe.send((None, True))
+            elif command == "close":
+                pipe.send((None, True))
+                break
+            elif command == "_call":
+                name, args, kwargs = data
+                if name in ["reset", "step", "seed", "close"]:
+                    raise ValueError(
+                        f"Trying to call function `{name}` with `_call`. "
+                        f"Use `{name}` directly instead."
+                    )
+                function = getattr(env, name)
+                if callable(function):
+                    pipe.send((function(*args, **kwargs), True))
+                else:
+                    pipe.send((function, True))
+            elif command == "_setattr":
+                name, value = data
+                setattr(env, name, value)
+                pipe.send((None, True))
+            elif command == "_check_spaces":
+                pipe.send(
+                    (
+                        (data[0] == env.observation_space, data[1] == env.action_space),
+                        True,
+                    )
+                )
+            else:
+                raise RuntimeError(
+                    f"Received unknown command `{command}`. Must be one of "
+                    "{`reset`, `step`, `seed`, `close`, `_call`, `_setattr`, "
+                    "`_check_spaces`}."
+                )
+    except (KeyboardInterrupt, Exception):
+        error_queue.put((index,) + sys.exc_info()[:2])
+        pipe.send((None, False))
+    finally:
+        env.close()
 
 
 def _create_single_env(config: SimulationConfig, idx: int) -> gym.Env:

@@ -209,6 +209,10 @@ class MultiStepWrapper(gym.Wrapper):
         states = []
         rewards = []
         dones = []
+        # Default for the case where the env is already done and the loop below
+        # breaks before stepping (e.g. a finished env re-stepped by the vector
+        # env while the rest of its chunk drains).
+        truncated = False
         for step in range(self.n_action_steps):
             act = {}
             for key, value in action.items():
@@ -249,7 +253,13 @@ class MultiStepWrapper(gym.Wrapper):
         info["dones"] = dones
         # Per-episode summary fields (surfaced via the vector env's `final_info`
         # so the caller can map each rollout's outcome back to its seed).
-        info["success_step"] = self.success_step
+        #
+        # `success_step` flows through gymnasium's vector `_add_info`, which fixes
+        # each info-array's dtype from the *first* env's value for the key. Mixing
+        # None (unsolved) and int (solved) across envs makes that array int and then
+        # chokes assigning None (`int(None)` -> TypeError). Emit a sentinel int
+        # (-1 = unsolved) so the dtype is always int; the caller maps it back to None.
+        info["success_step"] = self.success_step if self.success_step is not None else -1
         info["episode_base_step"] = self.episode_base_step
         info["episode_success"] = self.success_step is not None
         return observation, reward, done, truncated, info

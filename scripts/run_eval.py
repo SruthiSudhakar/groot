@@ -257,7 +257,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--render_camera",
         type=str,
-        default=None,
+        default="robot0_agentview_right",
         help="Camera for the saved videos. By default videos are the 256x256 policy "
         "observation image (robot0_agentview_left). Setting this renders a fresh frame "
         "straight from the sim using the named camera (e.g. robot0_agentview_center, "
