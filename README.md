@@ -130,17 +130,29 @@ This runs as **two cooperating processes** in separate terminals (the VLM ranker
 
 ### Prerequisites
 
-You will need:
+The ranker training code and serving script live in a separate repo — a
+lightly modified fork of Hugging Face `trl`:
 
-- A separate conda env (e.g. `vlmoverlay`) with the Qwen2.5-VL ranker installed
-- A VLM ranker checkpoint (`VLM_CKPT`)
-- The ranker serving script (`VLM_RANK_SERVER`) — a job-inbox/`ranking.json` poll-based server
+```bash
+git clone -b robocasa-vlm-release https://github.com/SruthiSudhakar/trl
+export TRL_REPO=$(pwd)/trl
+```
+
+See [`examples/scripts/robocasa_vlm/README.md`](https://github.com/SruthiSudhakar/trl/blob/robocasa-vlm-release/examples/scripts/robocasa_vlm/README.md)
+in that repo for env setup (`vlmoverlay` conda env) and how to train your own
+ranker checkpoint on RoboCasa policy rollouts. The launcher lives at
+`$TRL_REPO/examples/scripts/robocasa_vlm/launch_robocasa.sh` and the serving
+script at `$TRL_REPO/examples/scripts/robocasa_vlm/rank_serve_robocasa.py`.
+
+You will also need:
+
+- A trained VLM ranker checkpoint (`VLM_CKPT`)
 - A shared directory (`RANK_DIR`) for the inbox/done/error queues
 
 Set paths:
 
 ```bash
-export VLM_RANK_SERVER=/path/to/rank_serve_robocasa.py
+export VLM_RANK_SERVER=$TRL_REPO/examples/scripts/robocasa_vlm/rank_serve_robocasa.py
 export VLM_CKPT=/path/to/vlm_checkpoint
 export RANK_DIR=/path/to/shared/rank/dir
 export TASK=PickPlaceDrawerToCounter
@@ -204,8 +216,8 @@ CUDA_VISIBLE_DEVICES=2 MUJOCO_GL=egl python scripts/run_eval_vlm_ranking.py \
 Instead of the three-terminal setup, you can let `run_eval_vlm_ranking.py` spawn the ranker for you by pointing it at the ranker script and the python interpreter for the env the ranker runs under:
 
 ```bash
-export VLM_RANK_SERVER_SCRIPT=/path/to/rank_serve_robocasa.py
-export VLM_RANK_SERVER_PYTHON=/path/to/vlmoverlay/env/bin/python
+export VLM_RANK_SERVER_SCRIPT=$TRL_REPO/examples/scripts/robocasa_vlm/rank_serve_robocasa.py
+export VLM_RANK_SERVER_PYTHON=$(conda run -n vlmoverlay which python)
 
 MUJOCO_GL=egl python scripts/run_eval_vlm_ranking.py \
     --model_path "$CKPT" \
