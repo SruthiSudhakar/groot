@@ -127,3 +127,9 @@ output/
 videos/
 expdata/
 plots/
+
+
+run_*.sh
+scripts/recover_lang.sh
+scripts/my_recover_lang.py
+my_SETUP_AND_RUN_GROOT.sh

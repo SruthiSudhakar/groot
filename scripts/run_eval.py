@@ -245,7 +245,7 @@ if __name__ == "__main__":
         "--n_action_steps",
         type=int,
         help="Number of action steps per environment step.",
-        default=16,
+        default=32,
     )
     parser.add_argument(
         "--max_steps",
